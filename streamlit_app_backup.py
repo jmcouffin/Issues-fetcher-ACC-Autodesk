@@ -40,7 +40,11 @@ try:
 except ImportError:
     # Manual .env loading if python-dotenv is not available
     if os.path.exists(".env"):
-        with open(".env", "r", encoding="utf-8") as f:
+        with open(".en        else:
+            st.info("👆 Please authenticate and select a hub and project from the sidebar")
+
+    else:
+        st.info("🔐 Please authenticate using the sidebar to get started")coding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -320,10 +324,6 @@ def initialize_session_state():
         st.session_state.has_issues_access = False
     if "token_3leg" not in st.session_state:
         st.session_state.token_3leg = None
-    if "selected_hub_name" not in st.session_state:
-        st.session_state.selected_hub_name = None
-    if "selected_project_name" not in st.session_state:
-        st.session_state.selected_project_name = None
 
 
 def handle_oauth_callback():
@@ -383,11 +383,11 @@ def handle_oauth_callback():
                         # Clear URL parameters to clean up the URL
                         st.query_params.clear()
 
-                        # Load hubs immediately after authentication
-                        load_hubs()
-
-                        # Force a rerun to refresh the UI after loading hubs
+                        # Force a rerun to refresh the UI
                         st.rerun()
+
+                        # Load hubs
+                        load_hubs()
 
                     except Exception as e:
                         st.error(f"Error initializing APIs: {str(e)}")
@@ -492,23 +492,12 @@ APS_CALLBACK_URL=http://localhost:8080
 
 def load_hubs():
     """Load available hubs"""
-    st.info("🔍 Debug: load_hubs() called")
-    
     if not st.session_state.bim360:
-        st.error("🔍 Debug: BIM360 instance not available")
         return
 
-    st.info("🔍 Debug: BIM360 instance available, fetching hubs...")
-    
     try:
         with st.spinner("Loading hubs..."):
             hubs_data = st.session_state.bim360.get_hubs()
-            st.info(f"🔍 Debug: Raw hubs data type: {type(hubs_data)}")
-            
-            if isinstance(hubs_data, dict):
-                st.info(f"🔍 Debug: Hubs data keys: {hubs_data.keys()}")
-            elif isinstance(hubs_data, list):
-                st.info(f"🔍 Debug: Hubs data length: {len(hubs_data)}")
 
             st.session_state.hubs.clear()
 
@@ -519,15 +508,12 @@ def load_hubs():
             elif isinstance(hubs_data, dict) and "data" in hubs_data:
                 hubs_list = hubs_data["data"]
 
-            st.info(f"🔍 Debug: Processing {len(hubs_list)} hubs")
-
             for hub in hubs_list:
                 if isinstance(hub, dict) and "id" in hub:
                     hub_id = hub["id"]
                     hub_attrs = hub.get("attributes", {})
                     hub_name = hub_attrs.get("name", f"Hub {hub_id}")
                     st.session_state.hubs[hub_name] = hub_id
-                    st.info(f"🔍 Debug: Added hub: {hub_name} ({hub_id})")
 
             st.success(f"✅ Loaded {len(st.session_state.hubs)} hubs")
 
@@ -762,11 +748,6 @@ def main():
         if st.session_state.authenticated:
             st.header("📁 Project Selection")
 
-            # Debug information about hubs
-            st.write(f"🔍 Debug: Hubs loaded: {len(st.session_state.hubs)}")
-            if st.session_state.hubs:
-                st.write(f"🔍 Available hubs: {list(st.session_state.hubs.keys())}")
-
             # Hub selection
             if st.session_state.hubs:
                 hub_names = list(st.session_state.hubs.keys())
@@ -781,11 +762,6 @@ def main():
                     # Load projects for selected hub
                     if st.button("🔄 Refresh Projects"):
                         load_projects(hub_id)
-
-                    # Debug information about projects
-                    st.write(f"🔍 Debug: Projects loaded: {len(st.session_state.projects)}")
-                    if st.session_state.projects:
-                        st.write(f"🔍 Available projects: {list(st.session_state.projects.keys())}")
 
                     # Project selection
                     if st.session_state.projects:
@@ -806,27 +782,18 @@ def main():
                             if st.session_state.has_issues_access:
                                 if st.button("🔄 Load Issue Types"):
                                     load_issue_types(hub_id, project_id)
-                    else:
-                        st.info("No projects loaded. Click 'Refresh Projects' to load projects for the selected hub.")
-            else:
-                st.info("No hubs loaded. Hubs should load automatically after authentication.")
-                if st.button("🔄 Load Hubs"):
-                    load_hubs()
 
     # Main content area
     if st.session_state.authenticated:
+        # Check if we have the necessary data to show the main interface
         if st.session_state.hubs:
-            # Get the selected hub and project from session state (set by sidebar widgets)
+            # Get the selected hub and project from session state
             if hasattr(st.session_state, 'selected_hub_name') and st.session_state.selected_hub_name:
                 if hasattr(st.session_state, 'selected_project_name') and st.session_state.selected_project_name:
-                    # Use the user's actual selections from the sidebar
-                    selected_hub_name = st.session_state.selected_hub_name
-                    selected_project_name = st.session_state.selected_project_name
+                    hub_id = st.session_state.hubs[st.session_state.selected_hub_name]
+                    project_id = st.session_state.projects[st.session_state.selected_project_name]
 
-                    hub_id = st.session_state.hubs[selected_hub_name]
-                    project_id = st.session_state.projects[selected_project_name]
-
-                    st.header(f"📋 Issues for: {selected_project_name}")
+                    st.header(f"📋 Issues for: {st.session_state.selected_project_name}")
 
                     # Filters
                     col1, col2, col3 = st.columns([2, 2, 1])
@@ -914,7 +881,7 @@ def main():
                             if st.button("📄 Download as CSV"):
                                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                                 filename = (
-                                    f"issues_{selected_project_name}_{timestamp}.csv"
+                                    f"issues_{st.session_state.selected_project_name}_{timestamp}.csv"
                                 )
                                 st.markdown(
                                     download_csv(df, filename), unsafe_allow_html=True
@@ -924,7 +891,7 @@ def main():
                             if st.button("📊 Download as Excel"):
                                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                                 filename = (
-                                    f"issues_{selected_project_name}_{timestamp}.xlsx"
+                                    f"issues_{st.session_state.selected_project_name}_{timestamp}.xlsx"
                                 )
                                 st.markdown(
                                     download_excel(df, filename), unsafe_allow_html=True
@@ -935,11 +902,17 @@ def main():
                             "🔍 Select filters and click 'Fetch Issues' to load data"
                         )
                 else:
-                    st.info("� Please select a project from the sidebar to view and fetch issues.")
+                    st.info("📋 Please select a project from the sidebar to view and fetch issues.")
             else:
                 st.info("🏢 Please select a hub from the sidebar to continue.")
         else:
-            st.info("� Please authenticate and select a hub from the sidebar")
+            st.info("👆 Please authenticate and select a hub and project from the sidebar")
+        
+        elif st.session_state.hubs and not st.session_state.projects:
+            st.info("� Please select a hub and click 'Refresh Projects' to load projects")
+        
+        else:
+            st.info("🔄 Loading hubs and projects...")
 
     else:
         st.info("🔐 Please authenticate using the sidebar to get started")
