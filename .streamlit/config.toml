@@ -1,6 +1,3 @@
-[general]
-email = "your-email@example.com"
-
 [server]
 headless = true
 enableCORS = false
