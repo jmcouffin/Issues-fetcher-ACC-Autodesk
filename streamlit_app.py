@@ -132,11 +132,31 @@ class Manual3LeggedAuth:
     def __init__(self, client_id, client_secret):
         self.client_id = client_id
         self.client_secret = client_secret
-        self.callback_url = "http://localhost:8080/callback"
+
+        # Determine callback URL based on environment
+        if self._is_streamlit_cloud():
+            # For Streamlit Cloud deployment
+            self.callback_url = "https://issues-fetcher.streamlit.app/callback"
+            self.use_local_server = False
+        else:
+            # For local development
+            self.callback_url = "http://localhost:8080/callback"
+            self.use_local_server = True
+
         self.base_url = "https://developer.api.autodesk.com"
 
         # Scopes required for Issues API
         self.scopes = ["data:read", "data:write", "account:read", "code:all"]
+
+    def _is_streamlit_cloud(self):
+        """Detect if running on Streamlit Cloud"""
+        # Check various environment indicators for Streamlit Cloud
+        return (
+            os.getenv("STREAMLIT_SERVER_PORT") is not None
+            or os.getenv("STREAMLIT_SHARING_MODE") is not None
+            or "streamlit.app" in os.getenv("HOSTNAME", "")
+            or "streamlit" in os.getenv("USER", "").lower()
+        )
 
     def get_authorization_url(self):
         """Generate the authorization URL"""
@@ -188,6 +208,13 @@ class Manual3LeggedAuth:
 
     def authenticate(self):
         """Complete 3-legged authentication flow"""
+        if self.use_local_server:
+            return self._authenticate_with_local_server()
+        else:
+            return self._authenticate_with_manual_entry()
+
+    def _authenticate_with_local_server(self):
+        """Authenticate using local callback server (for development)"""
         # Start callback server
         server = self.start_callback_server()
 
@@ -218,6 +245,17 @@ class Manual3LeggedAuth:
 
         server.server_close()
         return None
+
+    def _authenticate_with_manual_entry(self):
+        """Authenticate using manual code entry (for cloud deployment)"""
+        # Generate authorization URL
+        auth_url = self.get_authorization_url()
+
+        # Store the auth URL in session state for the UI to use
+        st.session_state.auth_url = auth_url
+        st.session_state.waiting_for_auth_code = True
+
+        return None  # Will be handled by the UI
 
 
 # Create a simple Token class to mimic aps-toolkit Token
@@ -384,6 +422,10 @@ def initialize_session_state():
         st.session_state.client_id = ""
     if "client_secret" not in st.session_state:
         st.session_state.client_secret = ""
+    if "auth_url" not in st.session_state:
+        st.session_state.auth_url = None
+    if "waiting_for_auth_code" not in st.session_state:
+        st.session_state.waiting_for_auth_code = False
 
 
 def authenticate():
@@ -414,11 +456,21 @@ def authenticate():
             # Then, attempt 3-legged authentication for Issues API
             try:
                 st.info("🔐 Starting 3-legged authentication for Issues API...")
-                st.info("📖 A browser window will open for authorization...")
 
                 # Use manual 3-legged authentication
                 auth_3leg = Manual3LeggedAuth(client_id, client_secret)
-                token_data_3leg = auth_3leg.authenticate()
+
+                if auth_3leg.use_local_server:
+                    st.info("📖 A browser window will open for authorization...")
+                    token_data_3leg = auth_3leg.authenticate()
+                else:
+                    # For cloud deployment, we need manual code entry
+                    token_data_3leg = auth_3leg.authenticate()
+                    if token_data_3leg is None and st.session_state.get(
+                        "waiting_for_auth_code"
+                    ):
+                        # Authentication process started, will be completed in UI
+                        return "waiting_for_code"
 
                 if token_data_3leg:
                     st.success("✅ 3-legged authentication successful (Issues API)")
@@ -785,10 +837,82 @@ def main():
 
             # Authentication button
             auth_disabled = bool(validation_errors) or not (client_id and client_secret)
-            if st.button("🔐 Authenticate", type="primary", disabled=auth_disabled):
-                if authenticate():
-                    load_hubs()
-                    st.rerun()
+
+            # Handle cloud deployment manual authentication
+            if st.session_state.get("waiting_for_auth_code") and st.session_state.get(
+                "auth_url"
+            ):
+                st.info(
+                    "🔗 **Step 1:** Click the link below to authorize the application:"
+                )
+                st.markdown(
+                    f"[🔐 **Authorize Application**]({st.session_state.auth_url})"
+                )
+
+                st.info(
+                    "📋 **Step 2:** After authorization, you'll be redirected to a page with an authorization code. Copy and paste it below:"
+                )
+
+                auth_code = st.text_input(
+                    "Authorization Code:",
+                    help="Paste the authorization code from the redirect page",
+                    key="manual_auth_code",
+                )
+
+                col_auth1, col_auth2 = st.columns(2)
+                with col_auth1:
+                    if st.button("✅ Complete Authentication", disabled=not auth_code):
+                        if auth_code:
+                            try:
+                                # Get credentials
+                                client_id = st.session_state.client_id or os.getenv(
+                                    "APS_CLIENT_ID"
+                                )
+                                client_secret = (
+                                    st.session_state.client_secret
+                                    or os.getenv("APS_CLIENT_SECRET")
+                                )
+
+                                # Create auth object and exchange code for token
+                                auth_3leg = Manual3LeggedAuth(client_id, client_secret)
+                                token_data_3leg = auth_3leg.exchange_code_for_token(
+                                    auth_code
+                                )
+
+                                if token_data_3leg:
+                                    st.success(
+                                        "✅ 3-legged authentication successful (Issues API)"
+                                    )
+                                    # Create token object
+                                    token_3leg = SimpleToken(token_data_3leg)
+                                    # Initialize Issues API with 3-legged token
+                                    st.session_state.issues_api = IssuesAPI(token_3leg)
+                                    st.session_state.has_issues_access = True
+                                    st.session_state.authenticated = True
+                                    st.session_state.waiting_for_auth_code = False
+                                    st.session_state.auth_url = None
+                                    load_hubs()
+                                    st.rerun()
+                                else:
+                                    st.error(
+                                        "❌ Failed to exchange authorization code for token"
+                                    )
+                            except Exception as e:
+                                st.error(f"❌ Authentication failed: {str(e)}")
+
+                with col_auth2:
+                    if st.button("❌ Cancel"):
+                        st.session_state.waiting_for_auth_code = False
+                        st.session_state.auth_url = None
+                        st.rerun()
+            else:
+                if st.button("🔐 Authenticate", type="primary", disabled=auth_disabled):
+                    result = authenticate()
+                    if result == "waiting_for_code":
+                        st.rerun()  # Refresh to show manual code entry
+                    elif result:
+                        load_hubs()
+                        st.rerun()
         else:
             if st.session_state.has_issues_access:
                 st.success("✅ Authenticated (Full Access)")
@@ -827,7 +951,9 @@ def main():
             """
         1. **Create APS Application** at [APS Developer Portal](https://aps.autodesk.com/myapps):
            - App type: Web App
-           - Callback URL: `http://localhost:8080/callback`
+           - **Callback URLs** (add both):
+             - For local development: `http://localhost:8080/callback`
+             - For Streamlit Cloud: `https://issues-fetcher.streamlit.app/callback`
            - Enable APIs: Data Management, Construction Cloud Issues
            - Scopes: `data:read`, `data:write`, `account:read`, `code:all`
 
@@ -839,8 +965,12 @@ def main():
         3. **Add the custom integration to your hub admin portal**:
            - https://admin.b360.autodesk.com/admin/
            
-        4. **Troubleshooting**:
-           - Make sure your callback URL is exactly `http://localhost:8080/callback`
+        4. **Authentication Flow**:
+           - **Local Development**: Browser will open automatically for OAuth
+           - **Streamlit Cloud**: You'll get a link to click and then paste the authorization code
+           
+        5. **Troubleshooting**:
+           - Make sure your callback URLs include both local and cloud URLs
            - Ensure the required APIs are enabled in your APS app
            - Check that your user has access to the ACC/BIM 360 projects
         """
