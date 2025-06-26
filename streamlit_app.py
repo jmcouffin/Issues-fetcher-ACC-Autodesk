@@ -380,18 +380,24 @@ def initialize_session_state():
         st.session_state.current_issues = []
     if "current_container_id" not in st.session_state:
         st.session_state.current_container_id = None
+    if "client_id" not in st.session_state:
+        st.session_state.client_id = ""
+    if "client_secret" not in st.session_state:
+        st.session_state.client_secret = ""
 
 
 def authenticate():
     """Authenticate with Autodesk APS using both 2-legged and 3-legged auth"""
     with st.spinner("Authenticating..."):
         try:
-            # Get credentials
-            client_id = os.getenv("APS_CLIENT_ID")
-            client_secret = os.getenv("APS_CLIENT_SECRET")
+            # Get credentials from session state (user input) or environment
+            client_id = st.session_state.client_id or os.getenv("APS_CLIENT_ID")
+            client_secret = st.session_state.client_secret or os.getenv(
+                "APS_CLIENT_SECRET"
+            )
 
             if not client_id or not client_secret:
-                st.error("Missing APS_CLIENT_ID or APS_CLIENT_SECRET in environment")
+                st.error("Please provide both APS Client ID and Client Secret")
                 return False
 
             # First, get 2-legged token for Data Management API (hubs/projects)
@@ -695,6 +701,23 @@ def issues_to_dataframe(issues):
     return pd.DataFrame(data)
 
 
+def validate_credentials(client_id, client_secret):
+    """Validate APS credentials format"""
+    errors = []
+
+    if not client_id:
+        errors.append("Client ID is required")
+    elif len(client_id) < 10:
+        errors.append("Client ID appears to be too short")
+
+    if not client_secret:
+        errors.append("Client Secret is required")
+    elif len(client_secret) < 20:
+        errors.append("Client Secret appears to be too short")
+
+    return errors
+
+
 def main():
     """Main Streamlit application"""
     st.set_page_config(
@@ -716,7 +739,53 @@ def main():
 
         if not st.session_state.authenticated:
             st.warning("⚠️ Not authenticated")
-            if st.button("🔐 Authenticate", type="primary"):
+
+            # Credential input fields
+            st.subheader("APS Credentials")
+
+            # Load credentials from environment as defaults
+            default_client_id = os.getenv("APS_CLIENT_ID", "")
+            default_client_secret = os.getenv("APS_CLIENT_SECRET", "")
+
+            # Initialize session state with defaults if empty
+            if not st.session_state.client_id and default_client_id:
+                st.session_state.client_id = default_client_id
+            if not st.session_state.client_secret and default_client_secret:
+                st.session_state.client_secret = default_client_secret
+
+            client_id = st.text_input(
+                "APS Client ID:",
+                value=st.session_state.client_id,
+                type="default",
+                help="Enter your APS Application Client ID",
+            )
+
+            client_secret = st.text_input(
+                "APS Client Secret:",
+                value=st.session_state.client_secret,
+                type="password",
+                help="Enter your APS Application Client Secret",
+            )
+
+            # Update session state
+            st.session_state.client_id = client_id
+            st.session_state.client_secret = client_secret
+
+            # Validate credentials
+            validation_errors = validate_credentials(client_id, client_secret)
+
+            # Show validation
+            if not validation_errors and client_id and client_secret:
+                st.success("✅ Credentials provided")
+            elif validation_errors:
+                for error in validation_errors:
+                    st.warning(f"⚠️ {error}")
+            else:
+                st.info("💡 Enter your APS credentials above")
+
+            # Authentication button
+            auth_disabled = bool(validation_errors) or not (client_id and client_secret)
+            if st.button("🔐 Authenticate", type="primary", disabled=auth_disabled):
                 if authenticate():
                     load_hubs()
                     st.rerun()
@@ -725,6 +794,18 @@ def main():
                 st.success("✅ Authenticated (Full Access)")
             else:
                 st.warning("⚠️ Authenticated (Limited - No Issues API)")
+
+            # Show current credentials (masked)
+            st.subheader("Current Credentials")
+            if st.session_state.client_id:
+                masked_id = (
+                    st.session_state.client_id[:8] + "..."
+                    if len(st.session_state.client_id) > 8
+                    else st.session_state.client_id
+                )
+                st.text(f"Client ID: {masked_id}")
+            if st.session_state.client_secret:
+                st.text(f"Client Secret: {'*' * 8}")
 
             if st.button("🔄 Re-authenticate"):
                 # Reset authentication state
@@ -737,7 +818,7 @@ def main():
     # Main content area
     if not st.session_state.authenticated:
         st.info(
-            "Please authenticate using the sidebar to access your ACC/BIM 360 data."
+            "Please enter your APS credentials in the sidebar and authenticate to access your ACC/BIM 360 data."
         )
 
         # Display setup instructions
@@ -750,12 +831,18 @@ def main():
            - Enable APIs: Data Management, Construction Cloud Issues
            - Scopes: `data:read`, `data:write`, `account:read`, `code:all`
 
-        2. **Configure credentials**:
-           - Copy `config_template.env` to `.env`
-           - Add your APS Client ID and Client Secret
+        2. **Enter credentials**:
+           - Use the sidebar to enter your APS Client ID and Client Secret
+           - Alternatively, you can set environment variables `APS_CLIENT_ID` and `APS_CLIENT_SECRET`
+           - The app will automatically load credentials from environment if available
 
         3. **Add the custom integration to your hub admin portal**:
            - https://admin.b360.autodesk.com/admin/
+           
+        4. **Troubleshooting**:
+           - Make sure your callback URL is exactly `http://localhost:8080/callback`
+           - Ensure the required APIs are enabled in your APS app
+           - Check that your user has access to the ACC/BIM 360 projects
         """
         )
 
