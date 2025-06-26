@@ -135,8 +135,8 @@ class Manual3LeggedAuth:
 
         # Determine callback URL based on environment
         if self._is_streamlit_cloud():
-            # For Streamlit Cloud deployment
-            self.callback_url = "https://issues-fetcher.streamlit.app/callback"
+            # For Streamlit Cloud deployment - redirect to main app
+            self.callback_url = "https://issues-fetcher.streamlit.app/"
             self.use_local_server = False
         else:
             # For local development
@@ -156,6 +156,7 @@ class Manual3LeggedAuth:
             or os.getenv("STREAMLIT_SHARING_MODE") is not None
             or "streamlit.app" in os.getenv("HOSTNAME", "")
             or "streamlit" in os.getenv("USER", "").lower()
+            or "STREAMLIT" in os.environ
         )
 
     def get_authorization_url(self):
@@ -426,6 +427,12 @@ def initialize_session_state():
         st.session_state.auth_url = None
     if "waiting_for_auth_code" not in st.session_state:
         st.session_state.waiting_for_auth_code = False
+    if "oauth_callback_code" not in st.session_state:
+        st.session_state.oauth_callback_code = None
+    if "oauth_callback_received" not in st.session_state:
+        st.session_state.oauth_callback_received = False
+    if "oauth_callback_error" not in st.session_state:
+        st.session_state.oauth_callback_error = None
 
 
 def authenticate():
@@ -770,6 +777,46 @@ def validate_credentials(client_id, client_secret):
     return errors
 
 
+def check_oauth_callback():
+    """Check if we're returning from OAuth authorization with query parameters"""
+    # Get query parameters from the URL
+    query_params = st.query_params
+
+    # Check if we have an authorization code
+    if "code" in query_params:
+        auth_code = query_params["code"]
+        state = query_params.get("state", "")
+
+        # Verify the state parameter for security
+        if state == "streamlit_auth_state":
+            st.session_state.oauth_callback_code = auth_code
+            st.session_state.oauth_callback_received = True
+
+            # Clear the URL parameters to clean up the interface
+            st.query_params.clear()
+            return auth_code
+        else:
+            st.session_state.oauth_callback_error = (
+                "Invalid state parameter - possible security issue"
+            )
+            st.session_state.oauth_callback_received = True
+            st.query_params.clear()
+            return None
+
+    # Check if there's an error
+    if "error" in query_params:
+        error = query_params.get("error", "Unknown error")
+        error_description = query_params.get("error_description", "")
+        st.session_state.oauth_callback_error = f"{error}: {error_description}"
+        st.session_state.oauth_callback_received = True
+
+        # Clear the URL parameters
+        st.query_params.clear()
+        return None
+
+    return None
+
+
 def main():
     """Main Streamlit application"""
     st.set_page_config(
@@ -784,6 +831,60 @@ def main():
 
     # Initialize session state
     initialize_session_state()
+
+    # Check for OAuth callback first
+    oauth_code = check_oauth_callback()
+
+    # Handle OAuth callback if we received one
+    if oauth_code and not st.session_state.authenticated:
+        st.info("🔄 Processing OAuth callback...")
+        try:
+            # Get credentials
+            client_id = st.session_state.client_id or os.getenv("APS_CLIENT_ID")
+            client_secret = st.session_state.client_secret or os.getenv(
+                "APS_CLIENT_SECRET"
+            )
+
+            if client_id and client_secret:
+                # First, get 2-legged token for Data Management API (hubs/projects)
+                st.session_state.auth = Auth()
+                token_2leg = st.session_state.auth.auth2leg()
+                st.session_state.bim360 = BIM360(token_2leg)
+
+                # Exchange the OAuth code for a 3-legged token
+                auth_3leg = Manual3LeggedAuth(client_id, client_secret)
+                token_data_3leg = auth_3leg.exchange_code_for_token(oauth_code)
+
+                if token_data_3leg:
+                    st.success("✅ OAuth authentication successful!")
+                    # Create token object
+                    token_3leg = SimpleToken(token_data_3leg)
+                    # Initialize Issues API with 3-legged token
+                    st.session_state.issues_api = IssuesAPI(token_3leg)
+                    st.session_state.has_issues_access = True
+                    st.session_state.authenticated = True
+                    st.session_state.waiting_for_auth_code = False
+                    st.session_state.auth_url = None
+                    st.session_state.oauth_callback_received = False
+                    st.session_state.oauth_callback_code = None
+                    load_hubs()
+                    st.rerun()
+                else:
+                    st.error("❌ Failed to exchange authorization code for token")
+            else:
+                st.error("❌ Missing APS credentials. Please enter them and try again.")
+        except Exception as e:
+            st.error(f"❌ OAuth callback processing failed: {str(e)}")
+
+    # Handle OAuth error callback
+    if st.session_state.get("oauth_callback_error"):
+        st.error(
+            f"❌ OAuth authorization failed: {st.session_state.oauth_callback_error}"
+        )
+        st.session_state.oauth_callback_error = None
+
+    # Check for OAuth callback parameters in the URL
+    check_oauth_callback()
 
     # Sidebar for authentication and navigation
     with st.sidebar:
@@ -850,61 +951,17 @@ def main():
                 )
 
                 st.info(
-                    "📋 **Step 2:** After authorization, you'll be redirected to a page with an authorization code. Copy and paste it below:"
+                    "📋 **Step 2:** After authorization, you'll be automatically redirected back to this page."
                 )
 
-                auth_code = st.text_input(
-                    "Authorization Code:",
-                    help="Paste the authorization code from the redirect page",
-                    key="manual_auth_code",
+                st.warning(
+                    "⏳ Waiting for authorization... Please complete the authorization in the opened tab/window."
                 )
 
-                col_auth1, col_auth2 = st.columns(2)
-                with col_auth1:
-                    if st.button("✅ Complete Authentication", disabled=not auth_code):
-                        if auth_code:
-                            try:
-                                # Get credentials
-                                client_id = st.session_state.client_id or os.getenv(
-                                    "APS_CLIENT_ID"
-                                )
-                                client_secret = (
-                                    st.session_state.client_secret
-                                    or os.getenv("APS_CLIENT_SECRET")
-                                )
-
-                                # Create auth object and exchange code for token
-                                auth_3leg = Manual3LeggedAuth(client_id, client_secret)
-                                token_data_3leg = auth_3leg.exchange_code_for_token(
-                                    auth_code
-                                )
-
-                                if token_data_3leg:
-                                    st.success(
-                                        "✅ 3-legged authentication successful (Issues API)"
-                                    )
-                                    # Create token object
-                                    token_3leg = SimpleToken(token_data_3leg)
-                                    # Initialize Issues API with 3-legged token
-                                    st.session_state.issues_api = IssuesAPI(token_3leg)
-                                    st.session_state.has_issues_access = True
-                                    st.session_state.authenticated = True
-                                    st.session_state.waiting_for_auth_code = False
-                                    st.session_state.auth_url = None
-                                    load_hubs()
-                                    st.rerun()
-                                else:
-                                    st.error(
-                                        "❌ Failed to exchange authorization code for token"
-                                    )
-                            except Exception as e:
-                                st.error(f"❌ Authentication failed: {str(e)}")
-
-                with col_auth2:
-                    if st.button("❌ Cancel"):
-                        st.session_state.waiting_for_auth_code = False
-                        st.session_state.auth_url = None
-                        st.rerun()
+                if st.button("❌ Cancel Authorization"):
+                    st.session_state.waiting_for_auth_code = False
+                    st.session_state.auth_url = None
+                    st.rerun()
             else:
                 if st.button("🔐 Authenticate", type="primary", disabled=auth_disabled):
                     result = authenticate()
@@ -953,7 +1010,7 @@ def main():
            - App type: Web App
            - **Callback URLs** (add both):
              - For local development: `http://localhost:8080/callback`
-             - For Streamlit Cloud: `https://issues-fetcher.streamlit.app/callback`
+             - For Streamlit Cloud: `https://issues-fetcher.streamlit.app/`
            - Enable APIs: Data Management, Construction Cloud Issues
            - Scopes: `data:read`, `data:write`, `account:read`, `code:all`
 
@@ -967,10 +1024,11 @@ def main():
            
         4. **Authentication Flow**:
            - **Local Development**: Browser will open automatically for OAuth
-           - **Streamlit Cloud**: You'll get a link to click and then paste the authorization code
+           - **Streamlit Cloud**: You'll get a link to click and be automatically redirected back
            
         5. **Troubleshooting**:
            - Make sure your callback URLs include both local and cloud URLs
+           - For Streamlit Cloud, use the main app URL (without `/callback`)
            - Ensure the required APIs are enabled in your APS app
            - Check that your user has access to the ACC/BIM 360 projects
         """
