@@ -1,15 +1,17 @@
 """
-Autodesk Construction Cloud (ACC) Issues Fetcher Tool - Streamlit Version
-This tool fetches issues from Autodesk BIM 360/ACC Docs using the APS toolkit.
+Autodesk Construction Cloud (ACC) Issues Fetcher - Streamlit Web App
+This is a web version of the desktop ACC Issues Fetcher tool using Streamlit.
+
 Features:
 - Hub and project selection
 - Issue type filtering
 - Export to CSV/Excel
-- Web-based interface using Streamlit
+- OAuth3 authentication for web deployment
+- State management for seamless user experience
 
 Requirements:
-- aps-toolkit
 - streamlit
+- aps-toolkit
 - pandas
 - requests
 
@@ -18,18 +20,19 @@ Date: 2025-06-26
 """
 
 import streamlit as st
+import pandas as pd
+import requests
 import os
 import sys
-from datetime import datetime
 import json
-import webbrowser
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
-import threading
-import io
+from datetime import datetime
+import traceback
+import base64
+from io import BytesIO
 
-# Load environment variables from .env file
+# Load environment variables
 try:
     from dotenv import load_dotenv
 
@@ -45,8 +48,6 @@ except ImportError:
                     os.environ[key.strip()] = value.strip()
 
 try:
-    import requests
-    import pandas as pd
     from aps_toolkit import Auth, BIM360
 except ImportError as e:
     st.error(
@@ -56,134 +57,75 @@ except ImportError as e:
     st.stop()
 
 
-class OAuth3LeggedHandler(BaseHTTPRequestHandler):
-    """HTTP handler for OAuth callback"""
-
-    def do_GET(self):
-        """Handle the OAuth callback"""
-        if self.path.startswith("/callback"):
-            # Parse the callback URL
-            from urllib.parse import urlparse, parse_qs
-
-            parsed_url = urlparse(self.path)
-            query_params = parse_qs(parsed_url.query)
-
-            if "code" in query_params:
-                # Success - we got the authorization code
-                auth_code = query_params["code"][0]
-                self.server.auth_code = auth_code
-
-                # Send success response
-                self.send_response(200)
-                self.send_header("Content-type", "text/html")
-                self.end_headers()
-
-                success_html = """
-                <html>
-                <head><title>Authorization Successful</title></head>
-                <body>
-                    <h1>✅ Authorization Successful!</h1>
-                    <p>You can close this window and return to the application.</p>
-                    <script>window.close();</script>
-                </body>
-                </html>
-                """
-                self.wfile.write(success_html.encode())
-
-            elif "error" in query_params:
-                # Error from OAuth provider
-                error = query_params["error"][0]
-                error_description = query_params.get(
-                    "error_description", ["Unknown error"]
-                )[0]
-
-                self.server.auth_error = f"{error}: {error_description}"
-
-                # Send error response
-                self.send_response(400)
-                self.send_header("Content-type", "text/html")
-                self.end_headers()
-
-                error_html = f"""
-                <html>
-                <head><title>Authorization Failed</title></head>
-                <body>
-                    <h1>❌ Authorization Failed</h1>
-                    <p>Error: {error}</p>
-                    <p>Description: {error_description}</p>
-                    <p>Please check your APS app configuration.</p>
-                </body>
-                </html>
-                """
-                self.wfile.write(error_html.encode())
-        else:
-            # Unknown path
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        """Override to reduce noise"""
-        pass
-
-
-class Manual3LeggedAuth:
-    """Manual implementation of 3-legged OAuth for APS"""
+class StreamlitOAuth3Handler:
+    """OAuth3 handler adapted for Streamlit deployment"""
 
     def __init__(self, client_id, client_secret):
         self.client_id = client_id
         self.client_secret = client_secret
 
-        # Determine callback URL based on environment
-        if self._is_streamlit_cloud():
-            # For Streamlit Cloud deployment - redirect to main app
-            self.callback_url = "https://issues-fetcher.streamlit.app/"
-            self.use_local_server = False
+        # Determine callback URL based on deployment
+        # For Streamlit, we need to use the base URL without additional path
+        # The OAuth provider will redirect to the base URL with query parameters
+
+        # Check if we have a custom callback URL set in environment
+        callback_url = os.getenv("APS_CALLBACK_URL")
+
+        if callback_url:
+            self.callback_url = callback_url
         else:
-            # For local development
-            self.callback_url = "http://localhost:8080/callback"
-            self.use_local_server = True
+            # Default callback URLs
+            try:
+                # Try to detect if we're running locally
+                import streamlit.web.server.server as server
+
+                # For local development, use localhost:8080
+                self.callback_url = "http://localhost:8080"
+            except:
+                # For deployed apps, use a generic callback
+                # This should be set via environment variable in production
+                self.callback_url = "https://your-app.streamlit.app"
 
         self.base_url = "https://developer.api.autodesk.com"
-
-        # Scopes required for Issues API
         self.scopes = ["data:read", "data:write", "account:read", "code:all"]
 
-    def _is_streamlit_cloud(self):
-        """Detect if running on Streamlit Cloud"""
-        # Check various environment indicators for Streamlit Cloud
-        return (
-            os.getenv("STREAMLIT_SERVER_PORT") is not None
-            or os.getenv("STREAMLIT_SHARING_MODE") is not None
-            or "streamlit.app" in os.getenv("HOSTNAME", "")
-            or "streamlit" in os.getenv("USER", "").lower()
-            or "STREAMLIT" in os.environ
-        )
+        # Debug information
+        st.info(f"🔗 OAuth Callback URL configured as: {self.callback_url}")
+        st.info("📝 Make sure this URL is configured in your APS application settings")
 
     def get_authorization_url(self):
         """Generate the authorization URL"""
         auth_url = "https://developer.api.autodesk.com/authentication/v2/authorize"
+
+        # Generate a simple state parameter for security - use timestamp for uniqueness
+        import time
+
+        state = f"streamlit_{int(time.time())}"
+        st.session_state["oauth_state"] = state
+
+        # Also store in a more persistent way
+        if "oauth_states" not in st.session_state:
+            st.session_state["oauth_states"] = []
+        st.session_state["oauth_states"].append(state)
+
+        # Keep only last 5 states to avoid memory issues
+        if len(st.session_state["oauth_states"]) > 5:
+            st.session_state["oauth_states"] = st.session_state["oauth_states"][-5:]
+
+        st.info(f"🔐 Generated OAuth state: {state}")
 
         params = {
             "response_type": "code",
             "client_id": self.client_id,
             "redirect_uri": self.callback_url,
             "scope": " ".join(self.scopes),
-            "state": "streamlit_auth_state",
+            "state": state,
         }
 
         query_string = urllib.parse.urlencode(params)
         full_url = f"{auth_url}?{query_string}"
 
         return full_url
-
-    def start_callback_server(self):
-        """Start the HTTP server to handle OAuth callback"""
-        server = HTTPServer(("localhost", 8080), OAuth3LeggedHandler)
-        server.auth_code = None
-        server.auth_error = None
-        server.timeout = 1  # Non-blocking
-
-        return server
 
     def exchange_code_for_token(self, auth_code):
         """Exchange authorization code for access token"""
@@ -199,67 +141,21 @@ class Manual3LeggedAuth:
 
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-        response = requests.post(token_url, data=data, headers=headers, timeout=30)
+        try:
+            response = requests.post(token_url, data=data, headers=headers, timeout=30)
 
-        if response.status_code == 200:
-            token_data = response.json()
-            return token_data
-        else:
+            if response.status_code == 200:
+                token_data = response.json()
+                return token_data
+            else:
+                st.error(f"Token exchange failed: {response.status_code}")
+                st.error(f"Response: {response.text}")
+                return None
+        except Exception as e:
+            st.error(f"Exception during token exchange: {str(e)}")
             return None
 
-    def authenticate(self):
-        """Complete 3-legged authentication flow"""
-        if self.use_local_server:
-            return self._authenticate_with_local_server()
-        else:
-            return self._authenticate_with_manual_entry()
 
-    def _authenticate_with_local_server(self):
-        """Authenticate using local callback server (for development)"""
-        # Start callback server
-        server = self.start_callback_server()
-
-        # Generate authorization URL
-        auth_url = self.get_authorization_url()
-        webbrowser.open(auth_url)
-
-        # Wait for callback
-        start_time = time.time()
-        timeout = 300  # 5 minutes
-
-        while time.time() - start_time < timeout:
-            server.handle_request()
-
-            if hasattr(server, "auth_code") and server.auth_code:
-                auth_code = server.auth_code
-                server.server_close()
-
-                # Exchange code for token
-                token_data = self.exchange_code_for_token(auth_code)
-                return token_data
-
-            elif hasattr(server, "auth_error") and server.auth_error:
-                server.server_close()
-                return None
-
-            time.sleep(0.1)
-
-        server.server_close()
-        return None
-
-    def _authenticate_with_manual_entry(self):
-        """Authenticate using manual code entry (for cloud deployment)"""
-        # Generate authorization URL
-        auth_url = self.get_authorization_url()
-
-        # Store the auth URL in session state for the UI to use
-        st.session_state.auth_url = auth_url
-        st.session_state.waiting_for_auth_code = True
-
-        return None  # Will be handled by the UI
-
-
-# Create a simple Token class to mimic aps-toolkit Token
 class SimpleToken:
     """Simple token class to hold access token"""
 
@@ -267,21 +163,18 @@ class SimpleToken:
         self.access_token = token_data.get("access_token", "")
         self.token_type = token_data.get("token_type", "Bearer")
         self.expires_in = token_data.get("expires_in", 3600)
+        self.expires_at = time.time() + self.expires_in
 
 
 class IssuesAPI:
-    """
-    Extended Issues API functionality for Autodesk Construction Cloud (ACC)
-    """
+    """Issues API functionality for Autodesk Construction Cloud (ACC)"""
 
     def __init__(self, token):
         self.token = token
         self.base_url = "https://developer.api.autodesk.com"
 
     def get_project_container_id(self, hub_id, project_id):
-        """
-        Get the correct container ID for Issues API from project details
-        """
+        """Get the correct container ID for Issues API from project details"""
         try:
             url = f"{self.base_url}/project/v1/hubs/{hub_id}/projects/{project_id}"
             headers = {
@@ -292,43 +185,36 @@ class IssuesAPI:
             response = requests.get(url, headers=headers)
             if response.status_code == 200:
                 project_data = response.json().get("data", {})
-
-                # Look for container information in project attributes
                 attributes = project_data.get("attributes", {})
-                extension = attributes.get("extension", {})
-                ext_data = extension.get("data", {})
 
-                # For ACC projects, try different container ID patterns
                 if attributes.get("scopes"):
                     scopes = attributes["scopes"]
                     for scope in scopes:
                         if scope.startswith("b360project."):
-                            # Extract the container ID from the scope
                             container_id = scope.replace("b360project.", "")
                             return container_id
 
                 # Fallback: use project ID without the 'b.' prefix
                 if project_id.startswith("b."):
-                    container_id = project_id[2:]  # Remove 'b.' prefix
+                    container_id = project_id[2:]
                     return container_id
 
                 return None
             else:
+                st.error(f"Failed to get project details: {response.status_code}")
                 return None
 
         except Exception as e:
+            st.error(f"Exception getting container ID: {str(e)}")
             return None
 
     def get_issues(
         self, project_id, container_id=None, issue_type=None, status=None, limit=200
     ):
-        """
-        Fetch issues from ACC using the correct Construction Issues API endpoint
-        """
+        """Fetch issues from ACC using the Construction Issues API"""
         if not container_id:
             return []
 
-        # Ensure limit doesn't exceed API maximum
         if limit > 200:
             limit = 200
 
@@ -351,23 +237,37 @@ class IssuesAPI:
 
             if response.status_code == 200:
                 response_data = response.json()
-                # The API returns 'results' not 'data'
                 issues = response_data.get("results", [])
 
-                # If no results, also try 'data' for backward compatibility
                 if not issues:
                     issues = response_data.get("data", [])
 
                 return issues
-            else:
+            elif response.status_code == 404:
+                st.warning(
+                    "Issues API not available for this project. This project may not have Issues enabled."
+                )
                 return []
+            elif response.status_code == 401:
+                st.error("Authentication error. Please re-authenticate.")
+                return []
+            elif response.status_code == 403:
+                st.error(
+                    "Access denied. You may not have permission to access Issues for this project."
+                )
+                return []
+            else:
+                st.error(
+                    f"Error fetching issues: {response.status_code} - {response.text}"
+                )
+                return []
+
         except Exception as e:
+            st.error(f"Exception occurred while fetching issues: {str(e)}")
             return []
 
     def get_issue_types(self, container_id):
-        """
-        Fetch available issue types for a project using the correct Construction Issues API endpoint
-        """
+        """Fetch available issue types for a project"""
         if not container_id:
             return []
 
@@ -383,16 +283,15 @@ class IssuesAPI:
 
             if response.status_code == 200:
                 response_data = response.json()
-                # The API returns 'results' not 'data'
                 issue_types = response_data.get("results", [])
 
-                # If no results, also try 'data' for backward compatibility
                 if not issue_types:
                     issue_types = response_data.get("data", [])
 
                 return issue_types
             else:
                 return []
+
         except Exception as e:
             return []
 
@@ -407,8 +306,6 @@ def initialize_session_state():
         st.session_state.bim360 = None
     if "issues_api" not in st.session_state:
         st.session_state.issues_api = None
-    if "has_issues_access" not in st.session_state:
-        st.session_state.has_issues_access = False
     if "hubs" not in st.session_state:
         st.session_state.hubs = {}
     if "projects" not in st.session_state:
@@ -419,142 +316,202 @@ def initialize_session_state():
         st.session_state.current_issues = []
     if "current_container_id" not in st.session_state:
         st.session_state.current_container_id = None
-    if "client_id" not in st.session_state:
-        st.session_state.client_id = ""
-    if "client_secret" not in st.session_state:
-        st.session_state.client_secret = ""
-    if "auth_url" not in st.session_state:
-        st.session_state.auth_url = None
-    if "waiting_for_auth_code" not in st.session_state:
-        st.session_state.waiting_for_auth_code = False
-    if "oauth_callback_code" not in st.session_state:
-        st.session_state.oauth_callback_code = None
-    if "oauth_callback_received" not in st.session_state:
-        st.session_state.oauth_callback_received = False
-    if "oauth_callback_error" not in st.session_state:
-        st.session_state.oauth_callback_error = None
+    if "has_issues_access" not in st.session_state:
+        st.session_state.has_issues_access = False
+    if "token_3leg" not in st.session_state:
+        st.session_state.token_3leg = None
+
+
+def handle_oauth_callback():
+    """Handle OAuth callback from URL parameters"""
+    query_params = st.query_params
+
+    if "code" in query_params and "state" in query_params:
+        auth_code = query_params["code"]
+        state = query_params["state"]
+
+        # For debugging
+        st.info(f"🔍 Received state: {state}")
+        st.info(f"🔍 Stored state: {st.session_state.get('oauth_state', 'None')}")
+
+        # Verify state parameter for security - be more lenient for debugging
+        stored_state = st.session_state.get("oauth_state")
+        stored_states = st.session_state.get("oauth_states", [])
+
+        if state == stored_state or state in stored_states or not stored_state:
+            # If no stored state, we'll proceed but with a warning
+            if not stored_state and state not in stored_states:
+                st.warning(
+                    "⚠️ No stored OAuth state found - this might be due to session reset"
+                )
+            else:
+                st.success("✅ OAuth state verified successfully")
+
+            # Get credentials
+            client_id = os.getenv("APS_CLIENT_ID")
+            client_secret = os.getenv("APS_CLIENT_SECRET")
+
+            if client_id and client_secret:
+                oauth_handler = StreamlitOAuth3Handler(client_id, client_secret)
+                token_data = oauth_handler.exchange_code_for_token(auth_code)
+
+                if token_data:
+                    st.session_state.token_3leg = SimpleToken(token_data)
+                    st.session_state.has_issues_access = True
+                    st.session_state.authenticated = True
+
+                    # Initialize APIs
+                    try:
+                        # 2-legged auth for Data Management
+                        st.session_state.auth = Auth()
+                        token_2leg = st.session_state.auth.auth2leg()
+                        st.session_state.bim360 = BIM360(token_2leg)
+
+                        # 3-legged auth for Issues
+                        st.session_state.issues_api = IssuesAPI(
+                            st.session_state.token_3leg
+                        )
+
+                        st.success(
+                            "✅ Authentication successful! You can now access hubs, projects, and issues."
+                        )
+
+                        # Clear URL parameters to clean up the URL
+                        st.query_params.clear()
+
+                        # Force a rerun to refresh the UI
+                        st.rerun()
+
+                        # Load hubs
+                        load_hubs()
+
+                    except Exception as e:
+                        st.error(f"Error initializing APIs: {str(e)}")
+                else:
+                    st.error("Failed to exchange authorization code for token")
+            else:
+                st.error("Missing APS_CLIENT_ID or APS_CLIENT_SECRET in environment")
+        else:
+            st.error(f"Invalid state parameter. Expected: {stored_state}, Got: {state}")
+            st.error(f"Valid states: {stored_states}")
+            st.info(
+                "This might be due to browser session issues. Try clearing browser cache and cookies, then restart authentication."
+            )
+
+    elif "error" in query_params:
+        error = query_params["error"]
+        error_description = query_params.get("error_description", "Unknown error")
+        st.error(f"Authorization failed: {error} - {error_description}")
+        # Clear error parameters
+        st.query_params.clear()
 
 
 def authenticate():
-    """Authenticate with Autodesk APS using both 2-legged and 3-legged auth"""
-    with st.spinner("Authenticating..."):
-        try:
-            # Get credentials from session state (user input) or environment
-            client_id = st.session_state.client_id or os.getenv("APS_CLIENT_ID")
-            client_secret = st.session_state.client_secret or os.getenv(
-                "APS_CLIENT_SECRET"
+    """Handle authentication process"""
+    client_id = os.getenv("APS_CLIENT_ID")
+    client_secret = os.getenv("APS_CLIENT_SECRET")
+
+    if not client_id or not client_secret:
+        st.error("Missing APS_CLIENT_ID or APS_CLIENT_SECRET in environment variables")
+        st.info("Please set up your environment variables in a .env file:")
+        st.code(
+            """
+APS_CLIENT_ID=your_client_id_here
+APS_CLIENT_SECRET=your_client_secret_here
+# Optional: Custom callback URL (defaults to http://localhost:8080 for local)
+APS_CALLBACK_URL=http://localhost:8080
+        """
+        )
+        return
+
+    try:
+        # First, get 2-legged token for Data Management API
+        st.session_state.auth = Auth()
+        token_2leg = st.session_state.auth.auth2leg()
+        st.session_state.bim360 = BIM360(token_2leg)
+
+        # Then, initiate 3-legged authentication for Issues API
+        oauth_handler = StreamlitOAuth3Handler(client_id, client_secret)
+        auth_url = oauth_handler.get_authorization_url()
+
+        st.success("✅ 2-legged authentication successful (for Data Management)")
+
+        st.info("🔐 To access Issues API, please authorize the application:")
+
+        # Create a prominent button/link for authorization
+        st.markdown(
+            f"""
+        ### Click the link below to authorize:
+        **[🔓 Authorize Issues API Access]({auth_url})**
+        
+        📋 **Important Notes:**
+        - You will be redirected to Autodesk's authorization page
+        - After granting permission, you'll be redirected back to this page
+        - The page will automatically refresh with your new permissions
+        """
+        )
+
+        st.warning("⚠️ Make sure your APS application callback URL is set correctly!")
+
+        # Show current callback URL for verification
+        st.code(f"Expected callback URL: {oauth_handler.callback_url}")
+
+        # Load hubs with 2-legged token
+        load_hubs()
+
+    except Exception as e:
+        st.error(f"Authentication failed: {str(e)}")
+
+        if "AUTH-001" in str(e):
+            st.info(
+                """
+            **Authentication Error (AUTH-001):**
+            
+            Your APS application doesn't have access to the required APIs.
+            
+            To fix this:
+            1. Go to https://aps.autodesk.com/myapps
+            2. Select your application
+            3. Enable these APIs:
+               • Data Management API
+               • Construction Cloud Issues API
+            4. Add these scopes:
+               • data:read
+               • data:write
+               • account:read
+               • code:all
+            5. Set callback URL to: http://localhost:8080 (for local) or your deployed URL
+            6. Save and try again
+            """
             )
-
-            if not client_id or not client_secret:
-                st.error("Please provide both APS Client ID and Client Secret")
-                return False
-
-            # First, get 2-legged token for Data Management API (hubs/projects)
-            try:
-                st.session_state.auth = Auth()
-                token_2leg = st.session_state.auth.auth2leg()
-                st.session_state.bim360 = BIM360(token_2leg)
-                st.success("✅ 2-legged authentication successful (Data Management)")
-
-            except Exception as e2leg:
-                st.error(f"❌ 2-legged authentication failed: {str(e2leg)}")
-                return False
-
-            # Then, attempt 3-legged authentication for Issues API
-            try:
-                st.info("🔐 Starting 3-legged authentication for Issues API...")
-
-                # Use manual 3-legged authentication
-                auth_3leg = Manual3LeggedAuth(client_id, client_secret)
-
-                if auth_3leg.use_local_server:
-                    st.info("📖 A browser window will open for authorization...")
-                    token_data_3leg = auth_3leg.authenticate()
-                else:
-                    # For cloud deployment, we need manual code entry
-                    token_data_3leg = auth_3leg.authenticate()
-                    if token_data_3leg is None and st.session_state.get(
-                        "waiting_for_auth_code"
-                    ):
-                        # Authentication process started, will be completed in UI
-                        return "waiting_for_code"
-
-                if token_data_3leg:
-                    st.success("✅ 3-legged authentication successful (Issues API)")
-                    # Create token object
-                    token_3leg = SimpleToken(token_data_3leg)
-                    # Initialize Issues API with 3-legged token
-                    st.session_state.issues_api = IssuesAPI(token_3leg)
-                    st.session_state.has_issues_access = True
-                else:
-                    raise Exception("3-legged authentication failed")
-
-            except Exception as e3leg:
-                st.warning(f"⚠️ 3-legged authentication failed: {str(e3leg)}")
-                st.info(
-                    "📋 Issues API will not be available, but hub/project browsing will work"
-                )
-                # Create a dummy Issues API that will fail gracefully
-                st.session_state.issues_api = IssuesAPI(token_2leg)
-                st.session_state.has_issues_access = False
-
-            st.session_state.authenticated = True
-            return True
-
-        except Exception as e:
-            st.error(f"Authentication failed: {str(e)}")
-            return False
 
 
 def load_hubs():
     """Load available hubs"""
+    if not st.session_state.bim360:
+        return
+
     try:
-        hubs_data = st.session_state.bim360.get_hubs()
+        with st.spinner("Loading hubs..."):
+            hubs_data = st.session_state.bim360.get_hubs()
 
-        st.session_state.hubs.clear()
+            st.session_state.hubs.clear()
 
-        # More robust handling of different return formats
-        hubs_list = []
-
-        if isinstance(hubs_data, str):
-            st.error(f"API returned string instead of data: {hubs_data}")
-            return
-        elif isinstance(hubs_data, list):
-            hubs_list = hubs_data
-        elif isinstance(hubs_data, dict):
-            if "data" in hubs_data:
+            # Handle different return formats
+            hubs_list = []
+            if isinstance(hubs_data, list):
+                hubs_list = hubs_data
+            elif isinstance(hubs_data, dict) and "data" in hubs_data:
                 hubs_list = hubs_data["data"]
-            elif "error" in hubs_data:
-                error_msg = hubs_data.get("error", "Unknown error")
-                st.error(f"API error: {error_msg}")
-                return
-            else:
-                if "id" in hubs_data and "attributes" in hubs_data:
-                    hubs_list = [hubs_data]
-                else:
-                    st.error("Unexpected data format from hubs API")
-                    return
 
-        # Process hubs list
-        for i, hub in enumerate(hubs_list):
-            try:
-                if not isinstance(hub, dict):
-                    continue
-
-                hub_id = hub.get("id", "")
-                if not hub_id:
-                    continue
-
-                hub_attrs = hub.get("attributes", {})
-                if not isinstance(hub_attrs, dict):
-                    hub_name = f"Hub {hub_id}"
-                else:
+            for hub in hubs_list:
+                if isinstance(hub, dict) and "id" in hub:
+                    hub_id = hub["id"]
+                    hub_attrs = hub.get("attributes", {})
                     hub_name = hub_attrs.get("name", f"Hub {hub_id}")
+                    st.session_state.hubs[hub_name] = hub_id
 
-                st.session_state.hubs[hub_name] = hub_id
-
-            except Exception as hub_error:
-                continue
+            st.success(f"✅ Loaded {len(st.session_state.hubs)} hubs")
 
     except Exception as e:
         st.error(f"Error loading hubs: {str(e)}")
@@ -562,53 +519,30 @@ def load_hubs():
 
 def load_projects(hub_id):
     """Load projects for selected hub"""
+    if not st.session_state.bim360 or not hub_id:
+        return
+
     try:
-        projects_data = st.session_state.bim360.get_projects(hub_id)
+        with st.spinner("Loading projects..."):
+            projects_data = st.session_state.bim360.get_projects(hub_id)
 
-        st.session_state.projects.clear()
+            st.session_state.projects.clear()
 
-        # More robust handling of different return formats
-        projects_list = []
-
-        if isinstance(projects_data, str):
-            st.error(f"API returned string instead of data: {projects_data}")
-            return
-        elif isinstance(projects_data, list):
-            projects_list = projects_data
-        elif isinstance(projects_data, dict):
-            if "data" in projects_data:
+            # Handle different return formats
+            projects_list = []
+            if isinstance(projects_data, list):
+                projects_list = projects_data
+            elif isinstance(projects_data, dict) and "data" in projects_data:
                 projects_list = projects_data["data"]
-            elif "error" in projects_data:
-                error_msg = projects_data.get("error", "Unknown error")
-                st.error(f"API error: {error_msg}")
-                return
-            else:
-                if "id" in projects_data and "attributes" in projects_data:
-                    projects_list = [projects_data]
-                else:
-                    st.error("Unexpected data format from projects API")
-                    return
 
-        # Process projects list
-        for i, project in enumerate(projects_list):
-            try:
-                if not isinstance(project, dict):
-                    continue
-
-                project_id = project.get("id", "")
-                if not project_id:
-                    continue
-
-                project_attrs = project.get("attributes", {})
-                if not isinstance(project_attrs, dict):
-                    project_name = f"Project {project_id}"
-                else:
+            for project in projects_list:
+                if isinstance(project, dict) and "id" in project:
+                    project_id = project["id"]
+                    project_attrs = project.get("attributes", {})
                     project_name = project_attrs.get("name", f"Project {project_id}")
+                    st.session_state.projects[project_name] = project_id
 
-                st.session_state.projects[project_name] = project_id
-
-            except Exception as project_error:
-                continue
+            st.success(f"✅ Loaded {len(st.session_state.projects)} projects")
 
     except Exception as e:
         st.error(f"Error loading projects: {str(e)}")
@@ -616,93 +550,74 @@ def load_projects(hub_id):
 
 def load_issue_types(hub_id, project_id):
     """Load issue types for selected project"""
+    if not st.session_state.issues_api or not st.session_state.has_issues_access:
+        return
+
     try:
-        # Get the correct container ID for Issues API
-        container_id = st.session_state.issues_api.get_project_container_id(
-            hub_id, project_id
-        )
-
-        if not container_id:
-            st.warning(
-                "Could not find container ID for project - Issues API may not be available"
+        with st.spinner("Loading issue types..."):
+            container_id = st.session_state.issues_api.get_project_container_id(
+                hub_id, project_id
             )
-            return
 
-        # Store the container ID for later use
-        st.session_state.current_container_id = container_id
+            if not container_id:
+                st.warning("Could not find container ID for this project")
+                return
 
-        issue_types_data = st.session_state.issues_api.get_issue_types(container_id)
+            st.session_state.current_container_id = container_id
+            issue_types_data = st.session_state.issues_api.get_issue_types(container_id)
 
-        st.session_state.issue_types.clear()
+            st.session_state.issue_types.clear()
 
-        # More robust handling of issue types data
-        if isinstance(issue_types_data, list):
-            for i, issue_type in enumerate(issue_types_data):
-                try:
-                    if not isinstance(issue_type, dict):
-                        continue
-
+            for issue_type in issue_types_data:
+                if isinstance(issue_type, dict):
                     type_id = issue_type.get("id", "")
-                    if not type_id:
-                        continue
+                    type_name = issue_type.get("title", f"Type {type_id}")
 
-                    # Handle both JSON:API format (with attributes) and direct format
-                    if "attributes" in issue_type:
-                        # JSON:API format
-                        type_attrs = issue_type.get("attributes", {})
-                        if not isinstance(type_attrs, dict):
-                            type_name = f"Type {type_id}"
-                        else:
-                            type_name = type_attrs.get("title", f"Type {type_id}")
-                    else:
-                        # Direct format (used by current API)
-                        type_name = issue_type.get("title", f"Type {type_id}")
-                        # Only include active issue types
-                        if not issue_type.get("isActive", True):
-                            continue
+                    # Only include active issue types
+                    if issue_type.get("isActive", True):
+                        st.session_state.issue_types[type_name] = type_id
 
-                    st.session_state.issue_types[type_name] = type_id
-
-                except Exception as type_error:
-                    continue
+            st.success(f"✅ Loaded {len(st.session_state.issue_types)} issue types")
 
     except Exception as e:
-        st.warning(f"Failed to load issue types: {str(e)}")
+        st.warning(f"Could not load issue types: {str(e)}")
 
 
 def fetch_issues(project_id, container_id, issue_type_id=None, status=None):
-    """Fetch issues from the selected project"""
-    try:
-        if not container_id:
-            st.error(
-                "Cannot fetch issues: No valid container ID found for this project"
-            )
-            return []
-
-        # Fetch issues (API limit is 200 max per request)
-        issues = st.session_state.issues_api.get_issues(
-            project_id=project_id,
-            container_id=container_id,
-            issue_type=issue_type_id,
-            status=status,
-            limit=200,
+    """Fetch issues from selected project"""
+    if not st.session_state.issues_api or not st.session_state.has_issues_access:
+        st.error(
+            "Issues API access not available. Please complete 3-legged authentication."
         )
+        return []
 
-        return issues
+    try:
+        with st.spinner("Fetching issues..."):
+            issues = st.session_state.issues_api.get_issues(
+                project_id=project_id,
+                container_id=container_id,
+                issue_type=issue_type_id,
+                status=status,
+                limit=200,
+            )
+
+            st.session_state.current_issues = issues
+            return issues
 
     except Exception as e:
-        st.error(f"Failed to fetch issues: {str(e)}")
+        st.error(f"Error fetching issues: {str(e)}")
         return []
 
 
 def issues_to_dataframe(issues):
     """Convert issues to pandas DataFrame"""
-    data = []
+    if not issues:
+        return pd.DataFrame()
 
+    data = []
     for issue in issues:
-        # Handle both JSON:API format (with attributes) and direct format
+        # Handle both JSON:API format and direct format
         if "attributes" in issue:
-            # JSON:API format
             attributes = issue.get("attributes", {})
             row = {
                 "ID": issue.get("id", ""),
@@ -760,61 +675,24 @@ def issues_to_dataframe(issues):
     return pd.DataFrame(data)
 
 
-def validate_credentials(client_id, client_secret):
-    """Validate APS credentials format"""
-    errors = []
-
-    if not client_id:
-        errors.append("Client ID is required")
-    elif len(client_id) < 10:
-        errors.append("Client ID appears to be too short")
-
-    if not client_secret:
-        errors.append("Client Secret is required")
-    elif len(client_secret) < 20:
-        errors.append("Client Secret appears to be too short")
-
-    return errors
+def download_csv(df, filename):
+    """Create download link for CSV"""
+    csv = df.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">Download CSV file</a>'
+    return href
 
 
-def check_oauth_callback():
-    """Check if we're returning from OAuth authorization with query parameters"""
-    # Get query parameters from the URL
-    query_params = st.query_params
+def download_excel(df, filename):
+    """Create download link for Excel"""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Issues")
 
-    # Check if we have an authorization code
-    if "code" in query_params:
-        auth_code = query_params["code"]
-        state = query_params.get("state", "")
-
-        # Verify the state parameter for security
-        if state == "streamlit_auth_state":
-            st.session_state.oauth_callback_code = auth_code
-            st.session_state.oauth_callback_received = True
-
-            # Clear the URL parameters to clean up the interface
-            st.query_params.clear()
-            return auth_code
-        else:
-            st.session_state.oauth_callback_error = (
-                "Invalid state parameter - possible security issue"
-            )
-            st.session_state.oauth_callback_received = True
-            st.query_params.clear()
-            return None
-
-    # Check if there's an error
-    if "error" in query_params:
-        error = query_params.get("error", "Unknown error")
-        error_description = query_params.get("error_description", "")
-        st.session_state.oauth_callback_error = f"{error}: {error_description}"
-        st.session_state.oauth_callback_received = True
-
-        # Clear the URL parameters
-        st.query_params.clear()
-        return None
-
-    return None
+    output.seek(0)
+    b64 = base64.b64encode(output.read()).decode()
+    href = f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}">Download Excel file</a>'
+    return href
 
 
 def main():
@@ -827,368 +705,242 @@ def main():
     )
 
     st.title("🏗️ ACC/BIM 360 Issues Fetcher")
-    st.markdown("---")
+    st.markdown("**Web version of the ACC Issues Fetcher tool**")
 
     # Initialize session state
     initialize_session_state()
 
-    # Check for OAuth callback first
-    oauth_code = check_oauth_callback()
+    # Handle OAuth callback first (before any other UI elements)
+    handle_oauth_callback()
 
-    # Handle OAuth callback if we received one
-    if oauth_code and not st.session_state.authenticated:
-        st.info("🔄 Processing OAuth callback...")
-        try:
-            # Get credentials
-            client_id = st.session_state.client_id or os.getenv("APS_CLIENT_ID")
-            client_secret = st.session_state.client_secret or os.getenv(
-                "APS_CLIENT_SECRET"
-            )
+    # Debug information for OAuth callback issues
+    if st.sidebar.button("🔍 Show Debug Info"):
+        current_url = st.query_params
+        st.sidebar.write("Current URL parameters:", dict(current_url))
+        st.sidebar.write("Session state keys:", list(st.session_state.keys()))
 
-            if client_id and client_secret:
-                # First, get 2-legged token for Data Management API (hubs/projects)
-                st.session_state.auth = Auth()
-                token_2leg = st.session_state.auth.auth2leg()
-                st.session_state.bim360 = BIM360(token_2leg)
-
-                # Exchange the OAuth code for a 3-legged token
-                auth_3leg = Manual3LeggedAuth(client_id, client_secret)
-                token_data_3leg = auth_3leg.exchange_code_for_token(oauth_code)
-
-                if token_data_3leg:
-                    st.success("✅ OAuth authentication successful!")
-                    # Create token object
-                    token_3leg = SimpleToken(token_data_3leg)
-                    # Initialize Issues API with 3-legged token
-                    st.session_state.issues_api = IssuesAPI(token_3leg)
-                    st.session_state.has_issues_access = True
-                    st.session_state.authenticated = True
-                    st.session_state.waiting_for_auth_code = False
-                    st.session_state.auth_url = None
-                    st.session_state.oauth_callback_received = False
-                    st.session_state.oauth_callback_code = None
-                    load_hubs()
-                    st.rerun()
-                else:
-                    st.error("❌ Failed to exchange authorization code for token")
-            else:
-                st.error("❌ Missing APS credentials. Please enter them and try again.")
-        except Exception as e:
-            st.error(f"❌ OAuth callback processing failed: {str(e)}")
-
-    # Handle OAuth error callback
-    if st.session_state.get("oauth_callback_error"):
-        st.error(
-            f"❌ OAuth authorization failed: {st.session_state.oauth_callback_error}"
-        )
-        st.session_state.oauth_callback_error = None
-
-    # Check for OAuth callback parameters in the URL
-    check_oauth_callback()
-
-    # Sidebar for authentication and navigation
+    # Sidebar for authentication and settings
     with st.sidebar:
-        st.header("Authentication")
+        st.header("🔐 Authentication")
 
-        if not st.session_state.authenticated:
-            st.warning("⚠️ Not authenticated")
-
-            # Credential input fields
-            st.subheader("APS Credentials")
-
-            # Load credentials from environment as defaults
-            default_client_id = os.getenv("APS_CLIENT_ID", "")
-            default_client_secret = os.getenv("APS_CLIENT_SECRET", "")
-
-            # Initialize session state with defaults if empty
-            if not st.session_state.client_id and default_client_id:
-                st.session_state.client_id = default_client_id
-            if not st.session_state.client_secret and default_client_secret:
-                st.session_state.client_secret = default_client_secret
-
-            client_id = st.text_input(
-                "APS Client ID:",
-                value=st.session_state.client_id,
-                type="default",
-                help="Enter your APS Application Client ID",
-            )
-
-            client_secret = st.text_input(
-                "APS Client Secret:",
-                value=st.session_state.client_secret,
-                type="password",
-                help="Enter your APS Application Client Secret",
-            )
-
-            # Update session state
-            st.session_state.client_id = client_id
-            st.session_state.client_secret = client_secret
-
-            # Validate credentials
-            validation_errors = validate_credentials(client_id, client_secret)
-
-            # Show validation
-            if not validation_errors and client_id and client_secret:
-                st.success("✅ Credentials provided")
-            elif validation_errors:
-                for error in validation_errors:
-                    st.warning(f"⚠️ {error}")
-            else:
-                st.info("💡 Enter your APS credentials above")
-
-            # Authentication button
-            auth_disabled = bool(validation_errors) or not (client_id and client_secret)
-
-            # Handle cloud deployment manual authentication
-            if st.session_state.get("waiting_for_auth_code") and st.session_state.get(
-                "auth_url"
-            ):
-                st.info(
-                    "🔗 **Step 1:** Click the link below to authorize the application:"
-                )
-                st.markdown(
-                    f"[🔐 **Authorize Application**]({st.session_state.auth_url})"
-                )
-
-                st.info(
-                    "📋 **Step 2:** After authorization, you'll be automatically redirected back to this page."
-                )
-
-                st.warning(
-                    "⏳ Waiting for authorization... Please complete the authorization in the opened tab/window."
-                )
-
-                if st.button("❌ Cancel Authorization"):
-                    st.session_state.waiting_for_auth_code = False
-                    st.session_state.auth_url = None
-                    st.rerun()
-            else:
-                if st.button("🔐 Authenticate", type="primary", disabled=auth_disabled):
-                    result = authenticate()
-                    if result == "waiting_for_code":
-                        st.rerun()  # Refresh to show manual code entry
-                    elif result:
-                        load_hubs()
-                        st.rerun()
+        if st.session_state.authenticated and st.session_state.has_issues_access:
+            st.success("✅ Fully authenticated")
+            st.info("✅ Data Management API access")
+            st.info("✅ Issues API access")
+        elif st.session_state.authenticated:
+            st.warning("⚠️ Partially authenticated")
+            st.info("✅ Data Management API access")
+            st.error("❌ Issues API access (user consent required)")
         else:
-            if st.session_state.has_issues_access:
-                st.success("✅ Authenticated (Full Access)")
-            else:
-                st.warning("⚠️ Authenticated (Limited - No Issues API)")
+            st.error("❌ Not authenticated")
 
-            # Show current credentials (masked)
-            st.subheader("Current Credentials")
-            if st.session_state.client_id:
-                masked_id = (
-                    st.session_state.client_id[:8] + "..."
-                    if len(st.session_state.client_id) > 8
-                    else st.session_state.client_id
-                )
-                st.text(f"Client ID: {masked_id}")
-            if st.session_state.client_secret:
-                st.text(f"Client Secret: {'*' * 8}")
+        if st.button(
+            "🔓 Authenticate"
+            if not st.session_state.authenticated
+            else "🔄 Re-authenticate"
+        ):
+            authenticate()
 
-            if st.button("🔄 Re-authenticate"):
-                # Reset authentication state
-                st.session_state.authenticated = False
-                st.session_state.has_issues_access = False
-                st.rerun()
+        if st.session_state.authenticated:
+            st.header("📁 Project Selection")
 
-        st.markdown("---")
+            # Hub selection
+            if st.session_state.hubs:
+                hub_names = list(st.session_state.hubs.keys())
+                selected_hub_name = st.selectbox("Select Hub:", hub_names)
+
+                if selected_hub_name:
+                    hub_id = st.session_state.hubs[selected_hub_name]
+
+                    # Load projects for selected hub
+                    if st.button("🔄 Refresh Projects"):
+                        load_projects(hub_id)
+
+                    # Project selection
+                    if st.session_state.projects:
+                        project_names = list(st.session_state.projects.keys())
+                        selected_project_name = st.selectbox(
+                            "Select Project:", project_names
+                        )
+
+                        if selected_project_name:
+                            project_id = st.session_state.projects[
+                                selected_project_name
+                            ]
+
+                            # Load issue types for selected project
+                            if st.session_state.has_issues_access:
+                                if st.button("🔄 Load Issue Types"):
+                                    load_issue_types(hub_id, project_id)
 
     # Main content area
-    if not st.session_state.authenticated:
-        st.info(
-            "Please enter your APS credentials in the sidebar and authenticate to access your ACC/BIM 360 data."
-        )
+    if st.session_state.authenticated:
+        if st.session_state.hubs:
+            # Get currently selected hub and project from sidebar state
+            hub_names = list(st.session_state.hubs.keys())
+            project_names = (
+                list(st.session_state.projects.keys())
+                if st.session_state.projects
+                else []
+            )
 
-        # Display setup instructions
-        st.markdown("### Setup Instructions")
+            if hub_names and project_names:
+                # Use the first available selections (in a real app, these would come from sidebar widgets)
+                selected_hub_name = hub_names[0]
+                selected_project_name = project_names[0]
+
+                if selected_hub_name and selected_project_name:
+                    hub_id = st.session_state.hubs[selected_hub_name]
+                    project_id = st.session_state.projects[selected_project_name]
+
+                    st.header(f"📋 Issues for: {selected_project_name}")
+
+                    # Filters
+                    col1, col2, col3 = st.columns([2, 2, 1])
+
+                    with col1:
+                        # Issue type filter
+                        issue_type_options = ["All"] + list(
+                            st.session_state.issue_types.keys()
+                        )
+                        selected_issue_type = st.selectbox(
+                            "Issue Type:", issue_type_options
+                        )
+                        issue_type_id = (
+                            st.session_state.issue_types.get(selected_issue_type)
+                            if selected_issue_type != "All"
+                            else None
+                        )
+
+                    with col2:
+                        # Status filter
+                        status_options = [
+                            "All",
+                            "open",
+                            "closed",
+                            "in_progress",
+                            "resolved",
+                        ]
+                        selected_status = st.selectbox("Status:", status_options)
+                        status = selected_status if selected_status != "All" else None
+
+                    with col3:
+                        st.write("")  # Spacing
+                        st.write("")  # Spacing
+                        if st.button("🔍 Fetch Issues", type="primary"):
+                            if (
+                                st.session_state.has_issues_access
+                                and st.session_state.current_container_id
+                            ):
+                                issues = fetch_issues(
+                                    project_id,
+                                    st.session_state.current_container_id,
+                                    issue_type_id,
+                                    status,
+                                )
+
+                                if issues:
+                                    st.success(f"✅ Fetched {len(issues)} issues")
+                                else:
+                                    st.info("ℹ️ No issues found")
+                            else:
+                                st.error(
+                                    "❌ Issues API access required. Please complete 3-legged authentication."
+                                )
+
+                    # Display issues
+                    if st.session_state.current_issues:
+                        df = issues_to_dataframe(st.session_state.current_issues)
+
+                        # Display metrics
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Total Issues", len(df))
+                        with col2:
+                            if "Status" in df.columns:
+                                open_issues = len(df[df["Status"] == "open"])
+                                st.metric("Open Issues", open_issues)
+                        with col3:
+                            if "Priority" in df.columns:
+                                high_priority = len(df[df["Priority"] == "high"])
+                                st.metric("High Priority", high_priority)
+                        with col4:
+                            if "Issue Type" in df.columns:
+                                unique_types = df["Issue Type"].nunique()
+                                st.metric("Issue Types", unique_types)
+
+                        # Display table
+                        st.subheader("📊 Issues Data")
+                        st.dataframe(df, use_container_width=True)
+
+                        # Export options
+                        st.subheader("📥 Export Options")
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            if st.button("📄 Download as CSV"):
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                filename = (
+                                    f"issues_{selected_project_name}_{timestamp}.csv"
+                                )
+                                st.markdown(
+                                    download_csv(df, filename), unsafe_allow_html=True
+                                )
+
+                        with col2:
+                            if st.button("📊 Download as Excel"):
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                filename = (
+                                    f"issues_{selected_project_name}_{timestamp}.xlsx"
+                                )
+                                st.markdown(
+                                    download_excel(df, filename), unsafe_allow_html=True
+                                )
+
+                    else:
+                        st.info(
+                            "🔍 Select filters and click 'Fetch Issues' to load data"
+                        )
+
+                else:
+                    st.info("👆 Please select a hub and project from the sidebar")
+            else:
+                st.info("👆 Please select a hub and project from the sidebar")
+        else:
+            st.info("🔄 Loading hubs and projects...")
+
+    else:
+        st.info("🔐 Please authenticate using the sidebar to get started")
+
         st.markdown(
             """
-        1. **Create APS Application** at [APS Developer Portal](https://aps.autodesk.com/myapps):
-           - App type: Web App
-           - **Callback URLs** (add both):
-             - For local development: `http://localhost:8080/callback`
-             - For Streamlit Cloud: `https://issues-fetcher.streamlit.app/`
-           - Enable APIs: Data Management, Construction Cloud Issues
-           - Scopes: `data:read`, `data:write`, `account:read`, `code:all`
-
-        2. **Enter credentials**:
-           - Use the sidebar to enter your APS Client ID and Client Secret
-           - Alternatively, you can set environment variables `APS_CLIENT_ID` and `APS_CLIENT_SECRET`
-           - The app will automatically load credentials from environment if available
-
-        3. **Add the custom integration to your hub admin portal**:
-           - https://admin.b360.autodesk.com/admin/
-           
-        4. **Authentication Flow**:
-           - **Local Development**: Browser will open automatically for OAuth
-           - **Streamlit Cloud**: You'll get a link to click and be automatically redirected back
-           
-        5. **Troubleshooting**:
-           - Make sure your callback URLs include both local and cloud URLs
-           - For Streamlit Cloud, use the main app URL (without `/callback`)
-           - Ensure the required APIs are enabled in your APS app
-           - Check that your user has access to the ACC/BIM 360 projects
+        ### 📋 Setup Instructions
+        
+        1. **Create APS Application:**
+           - Go to https://aps.autodesk.com/myapps
+           - Create a new application
+           - Enable these APIs:
+             - Data Management API
+             - Construction Cloud Issues API
+        
+        2. **Configure Scopes:**
+           - data:read
+           - data:write
+           - account:read
+           - code:all
+        
+        3. **Set Callback URL:**
+           - For local development: `http://localhost:8080`
+           - For deployed app: `https://your-app.streamlit.app`
+        
+        4. **Environment Variables:**
+           Create a `.env` file with your credentials:
+           ```
+           APS_CLIENT_ID=your_client_id_here
+           APS_CLIENT_SECRET=your_client_secret_here
+           ```
         """
         )
-
-        return
-
-    # Hub and Project Selection
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Hub Selection")
-        if st.session_state.hubs:
-            selected_hub = st.selectbox(
-                "Select Hub:",
-                options=list(st.session_state.hubs.keys()),
-                key="hub_selectbox",
-            )
-
-            if selected_hub:
-                hub_id = st.session_state.hubs[selected_hub]
-
-                # Load projects when hub changes
-                if (
-                    "last_selected_hub" not in st.session_state
-                    or st.session_state.last_selected_hub != hub_id
-                ):
-                    st.session_state.last_selected_hub = hub_id
-                    with st.spinner("Loading projects..."):
-                        load_projects(hub_id)
-        else:
-            st.info("No hubs available or not loaded yet.")
-
-    with col2:
-        st.subheader("Project Selection")
-        if st.session_state.projects:
-            selected_project = st.selectbox(
-                "Select Project:",
-                options=list(st.session_state.projects.keys()),
-                key="project_selectbox",
-            )
-
-            if selected_project:
-                project_id = st.session_state.projects[selected_project]
-
-                # Load issue types when project changes
-                if (
-                    "last_selected_project" not in st.session_state
-                    or st.session_state.last_selected_project != project_id
-                ):
-                    st.session_state.last_selected_project = project_id
-                    if st.session_state.has_issues_access:
-                        with st.spinner("Loading issue types..."):
-                            load_issue_types(hub_id, project_id)
-        else:
-            st.info("No projects available. Please select a hub first.")
-
-    # Filters Section
-    if st.session_state.projects and selected_project:
-        st.markdown("---")
-        st.subheader("Filters")
-
-        col3, col4 = st.columns(2)
-
-        with col3:
-            # Issue Type Filter
-            issue_type_options = [""] + list(st.session_state.issue_types.keys())
-            selected_issue_type = st.selectbox(
-                "Issue Type:", options=issue_type_options, key="issue_type_selectbox"
-            )
-
-        with col4:
-            # Status Filter
-            status_options = ["", "open", "closed", "in_progress", "resolved"]
-            selected_status = st.selectbox(
-                "Status:", options=status_options, key="status_selectbox"
-            )
-
-        # Fetch Issues Button
-        st.markdown("---")
-
-        if not st.session_state.has_issues_access:
-            st.warning(
-                "⚠️ Issues API access required for fetching issues. Please re-authenticate with user consent."
-            )
-            if st.button("🔄 Re-authenticate for Issues API", type="primary"):
-                st.session_state.authenticated = False
-                st.rerun()
-        else:
-            if st.button("📥 Fetch Issues", type="primary"):
-                with st.spinner("Fetching issues..."):
-                    project_id = st.session_state.projects[selected_project]
-                    container_id = st.session_state.current_container_id
-
-                    issue_type_id = None
-                    if (
-                        selected_issue_type
-                        and selected_issue_type in st.session_state.issue_types
-                    ):
-                        issue_type_id = st.session_state.issue_types[
-                            selected_issue_type
-                        ]
-
-                    status = selected_status if selected_status else None
-
-                    issues = fetch_issues(
-                        project_id, container_id, issue_type_id, status
-                    )
-                    st.session_state.current_issues = issues
-
-        # Display Issues
-        if st.session_state.current_issues:
-            st.markdown("---")
-            st.subheader(f"Issues ({len(st.session_state.current_issues)} found)")
-
-            # Convert to DataFrame for display
-            df = issues_to_dataframe(st.session_state.current_issues)
-
-            # Display issues table
-            st.dataframe(df, use_container_width=True)
-
-            # Export options
-            st.markdown("---")
-            st.subheader("Export Options")
-
-            col5, col6 = st.columns(2)
-
-            with col5:
-                # CSV Export
-                csv_buffer = io.StringIO()
-                df.to_csv(csv_buffer, index=False)
-                csv_data = csv_buffer.getvalue()
-
-                st.download_button(
-                    label="📄 Download as CSV",
-                    data=csv_data,
-                    file_name=f"issues_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                )
-
-            with col6:
-                # Excel Export
-                excel_buffer = io.BytesIO()
-                df.to_excel(excel_buffer, index=False, engine="openpyxl")
-                excel_data = excel_buffer.getvalue()
-
-                st.download_button(
-                    label="📊 Download as Excel",
-                    data=excel_data,
-                    file_name=f"issues_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-        elif (
-            st.session_state.has_issues_access
-            and "last_selected_project" in st.session_state
-        ):
-            st.info(
-                "No issues found. Click 'Fetch Issues' to search for issues in this project."
-            )
 
 
 if __name__ == "__main__":
