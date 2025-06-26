@@ -8,7 +8,9 @@ A tool to fetch issues from Autodesk Construction Cloud (ACC) and BIM 360 projec
 - Browse hubs and projects
 - Filter issues by type and status
 - Export to CSV or Excel
-- Simple GUI interface
+- Two interface options:
+  - **Tkinter GUI** (`script.py`) - Desktop application
+  - **Streamlit Web App** (`streamlit_app.py`) - Web-based interface
 
 ## Prerequisites
 
@@ -38,12 +40,22 @@ A tool to fetch issues from Autodesk Construction Cloud (ACC) and BIM 360 projec
 
 ## Usage for the common people
 
-1. Run the application: `python script.py` OR Run the .bat file
+### Option 1: Desktop Application (Tkinter)
+1. Run the application: `python script.py` OR Run the `run.bat` file
 2. Click "Authenticate" (browser will open)
 3. Select hub and project from dropdowns
 4. Apply filters if needed
 5. Click "Fetch Issues"
 6. Export results using CSV or Excel buttons
+
+### Option 2: Web Application (Streamlit)
+1. Run the application: `streamlit run streamlit_app.py` OR Run the `run_streamlit.bat` file
+2. Open your browser to `http://localhost:8501`
+3. Click "Authenticate" in the sidebar (browser will open)
+4. Select hub and project from dropdowns
+5. Apply filters if needed
+6. Click "Fetch Issues"
+7. Download results using CSV or Excel buttons
 
 
 
